@@ -1,3 +1,5 @@
+![dashboard](https://albertmillan.wordpress.com/wp-content/uploads/2024/08/dashboard.jpg?w=1024)
+
 **INTRODUCCIÓN**
 
 Toda mi experiencia laboral previa se centra en el sector social, mayoritariamente con personas con discapacidad intelectual. Durante muchos años he trabajado como educador en pisos tutelados donde he aprendido muchísimo. Por eso mismo me parecía muy interesante ver qué evolución han tenido este tipo de viviendas y qué características tienen a partir de un dashboard realizado con Tableau.
@@ -10,8 +12,8 @@ Tras juguetear un poco con los datos, vi que era necesario restructurar la base 
 
 
 **FUENTE DE LOS DATOS**
-- [Registre d’entitats, serveis i establiments socials serveis socials bàsics i especialitzats] (https://analisi.transparenciacatalunya.cat/Societat-benestar/Registre-d-entitats-serveis-i-establiments-socials/ivft-vegh/about_data)
-- [Estadístiques de persones amb discapacitat] (https://dretssocials.gencat.cat/ca/ambits_tematics/persones_amb_discapacitat/estadistiquesdiscapacitat) 
+- [Registre d’entitats, serveis i establiments socials serveis socials bàsics i especialitzats](https://analisi.transparenciacatalunya.cat/Societat-benestar/Registre-d-entitats-serveis-i-establiments-socials/ivft-vegh/about_data)
+- [Estadístiques de persones amb discapacitat](https://dretssocials.gencat.cat/ca/ambits_tematics/persones_amb_discapacitat/estadistiquesdiscapacitat) 
 
 
 **CONTENIDO DEL DASHBOARD**
