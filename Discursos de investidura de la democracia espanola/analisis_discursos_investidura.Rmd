@@ -1,0 +1,1209 @@
+---
+title: "Análisis del lenguaje en los discursos de investidura de la democracia española actual"
+author: "Albert Millán Iniesta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9)
+```
+
+# Introducción
+
+Este documento analiza los discursos de investidura de la democracia española actual (1979-2023), combinando varias técnicas de análisis de texto en R con `quanteda`:
+
+1. **Estilo y forma**: legibilidad (índice Fernández-Huerta) y riqueza léxica (MATTR) sobre lemas.
+2. **Contenido léxico**: frecuencias, *keyness* por discurso individual, contexto de palabras clave (KWIC) y un diccionario temático propio.
+3. **Similitud entre discursos**: matriz TF-IDF + coseno y clustering jerárquico.
+4. **Modelado de temas** (*Structural Topic Model*): agendas latentes por exclusividad (*FREX*), con una prueba de robustez comparando dos configuraciones del modelo.
+5. **Sentimiento y perfil emocional**: dos léxicos independientes (uno traducido, uno nativo en español) para poder contrastar resultados entre sí.
+
+Todo ello sobre una base de **lematización morfosintáctica** (`UDPipe`, filtrando por categoría gramatical) y **ponderación TF-IDF** donde corresponde, para resaltar términos genuinamente informativos frente a los muy comunes en todo el corpus.
+
+*Este proyecto se ha desarrollado con la colaboración de Claude (Anthropic) como
+asistente técnico. Las decisiones de diseño, la interpretación de resultados y
+la verificación final son propias — ver el README del repositorio para más
+detalle sobre el proceso.*
+
+---
+
+# 0. Librerías y Configuración
+
+```{r 0.-librerías-y-configuración}
+# Lematización y PLN avanzado
+library(udpipe)
+
+# Modelado de temas y funciones de suavizado
+library(stm)
+library(splines)
+
+# Manejo de corpus y texto
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(readtext)
+library(stringi)
+
+# Datos y visualización
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(kableExtra)
+library(DT)
+
+# Nubes de palabras
+library(wordcloud2)
+
+# Sentimiento y emociones
+library(syuzhet)
+
+# Similitud y clustering
+library(ggdendro)
+
+# Reordenación dentro de facetas
+library(tidytext)
+
+# Rutas
+library(here)
+
+# Paleta corporativa fija por partido político
+colores_partidos <- c(
+  "UCD"  = "#1F77B4",
+  "PSOE" = "#E30613",
+  "PP"   = "#0056A3"
+)
+
+# Nombres cortos y con tilde para etiquetas de gráfico (el docname completo,
+# p. ej. "2004RodriguezZapatero", no cabe en ejes ni facetas). Se combina con
+# el año una vez cargado el corpus, más abajo en la sección 1.
+nombres_cortos <- c(
+  "Suarez" = "Suárez", "CalvoSotelo" = "Calvo-Sotelo", "Gonzalez" = "González",
+  "Aznar" = "Aznar", "RodriguezZapatero" = "Zapatero", "Rajoy" = "Rajoy",
+  "Sanchez" = "Sánchez"
+)
+```
+
+```{r dt-dependencias, include=FALSE}
+DT::datatable(data.frame())
+```
+
+---
+
+# 1. Carga y preparación del corpus
+
+Cargamos los 15 discursos como un corpus de `quanteda` y extraemos año,
+presidente y partido directamente del nombre de archivo (p. ej.
+`2004RodriguezZapatero.txt`). Fijamos el orden de los factores `Presidente` y
+`Partido` por año, para que todos los gráficos posteriores salgan ya en orden
+cronológico sin tener que reordenar cada vez.
+
+```{r 1.-carga-y-preparación-del-corpus}
+ruta_discursos <- here::here("data", "discursos")
+
+textos <- readtext(paste0(ruta_discursos, "/*.txt"), encoding = "UTF-8")
+textos$doc_id <- gsub(".txt", "", textos$doc_id)
+
+discursos <- corpus(textos)
+
+# Metadatos
+docvars(discursos, "Año") <- as.integer(substring(docnames(discursos), 1, 4))
+docvars(discursos, "Presidente") <- substring(docnames(discursos), 5)
+
+partidos <- c(
+  "Suarez"            = "UCD",
+  "CalvoSotelo"       = "UCD",
+  "Gonzalez"          = "PSOE",
+  "Aznar"             = "PP",
+  "RodriguezZapatero" = "PSOE",
+  "Rajoy"             = "PP",
+  "Sanchez"           = "PSOE"
+)
+docvars(discursos, "Partido") <- partidos[docvars(discursos, "Presidente")]
+
+docvars(discursos, "Presidente") <- factor(
+  docvars(discursos, "Presidente"),
+  levels = unique(docvars(discursos, "Presidente")[order(docvars(discursos, "Año"))])
+)
+docvars(discursos, "Partido") <- factor(
+  docvars(discursos, "Partido"),
+  levels = c("UCD", "PSOE", "PP")
+)
+
+# Etiqueta compacta "Año Presidente" para ejes y facetas (el docname completo
+# no cabe, y el año solo no basta para quien no sepa de memoria qué
+# presidente corresponde a cada año). Se calcula una sola vez aquí y se
+# reutiliza en todos los gráficos del documento.
+etiquetas_fila <- setNames(
+  paste(docvars(discursos, "Año"), nombres_cortos[as.character(docvars(discursos, "Presidente"))]),
+  docnames(discursos)
+)
+
+# Dos versiones del orden, para dos usos distintos:
+# - orden_fila: MÁS RECIENTE primero -- para facet_grid del KWIC (sección 3.6),
+#   donde quanteda coloca la primera etiqueta de la lista arriba del todo.
+# - orden_cronologico: MÁS ANTIGUO primero -- para el eje X de gráficos de
+#   barras/columnas normales, donde la primera etiqueta va a la izquierda.
+#   Es un error fácil de cometer: usar orden_fila por error aquí deja 2023
+#   a la izquierda y 1979 a la derecha.
+orden_fila <- rev(unique(etiquetas_fila[docnames(discursos)]))
+orden_cronologico <- unique(etiquetas_fila[docnames(discursos)])
+```
+
+## Resumen descriptivo del corpus
+
+`Types` es el vocabulario distinto (palabras únicas) de cada discurso;
+`Tokens` es el recuento bruto de palabras, incluida la puntuación en este
+resumen inicial; `Sentences`, el número de frases. Sirve como punto de
+partida para detectar a simple vista discursos atípicos por extensión antes
+de entrar en métricas más finas.
+
+```{r 1.1-resumen-del-corpus}
+resumen_corpus <- summary(discursos, n = ndoc(discursos)) %>%
+  mutate(Partido = docvars(discursos, "Partido"))
+
+kable(resumen_corpus, caption = "Métricas descriptivas básicas del corpus") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "center")
+```
+
+## 1.2 Lematización morfosintáctica (`UDPipe`)
+
+A diferencia del simple *stemming* (recorte de sufijos), la **lematización** analiza la categoría gramatical de cada palabra para reducirla a su lema canónico. Filtramos para conservar **sustantivos, nombres propios y adjetivos**, y descartamos los verbos.
+
+*Aviso breve: no es que los verbos carezcan de contenido (los tienen, y mucho)
+— se excluyen por un motivo práctico, no porque "no importen". Justificación
+completa en el informe, apartado 2.2.*
+
+*Aviso adicional sobre fiabilidad del etiquetado: "insisto" (un verbo que
+Rajoy inserta como inciso parentético) sobrevivió al filtro pese a no ser
+sustantivo, adjetivo ni nombre propio — UDPipe no etiqueta perfectamente
+los verbos usados de esta forma. Caso aislado, no sistemático.*
+
+```{r 1.2-lematización-con-udpipe-(análisis-morfosintáctico)}
+# 1. Comprobar si el modelo en español ya está descargado (ruta robusta con here(),
+#    para que no dependa de cuál sea el directorio de trabajo activo en RStudio)
+ruta_modelo <- here::here("data", "modelos")
+dir.create(ruta_modelo, showWarnings = FALSE, recursive = TRUE)
+
+archivos_existentes <- list.files(ruta_modelo, pattern = "spanish-ancora-ud-.*\\.udpipe$",
+                                   full.names = TRUE)
+
+if (length(archivos_existentes) > 0) {
+  ud_model <- udpipe_load_model(archivos_existentes[1])
+} else {
+  m_es <- udpipe_download_model(language = "spanish-ancora", model_dir = ruta_modelo,
+                                 overwrite = FALSE)
+  ud_model <- udpipe_load_model(m_es$file_model)
+}
+
+df_textos <- data.frame(
+  doc_id = docnames(discursos),
+  text = as.character(discursos),
+  stringsAsFactors = FALSE
+)
+
+# 2. Anotación morfosintáctica — es el paso más lento de todo el documento
+#    (analiza cada palabra de los 15 discursos). La cacheamos en disco para no
+#    tener que repetirla cada vez que hagas Knit; solo se recalcula si borras
+#    el archivo .rds o cambias los textos de origen.
+ruta_cache_anno <- here::here("data", "anno_udpipe_cache.rds")
+
+if (file.exists(ruta_cache_anno)) {
+  anno_df <- readRDS(ruta_cache_anno)
+} else {
+  anno <- udpipe_annotate(ud_model, x = df_textos$text, doc_id = df_textos$doc_id)
+  anno_df <- as.data.frame(anno)
+  saveRDS(anno_df, ruta_cache_anno)
+}
+
+# 3. Stopwords institucionales (los verbos ya quedan fuera con el filtro de upos
+#    de más abajo, así que aquí solo hace falta la lista de sustantivos/nombres vacíos)
+#
+#    Nota: incluimos "señoría" Y "señorías" a propósito. UDPipe no lematiza
+#    con un 100% de precisión -- la mayoría de apariciones de "señorías" sí
+#    se reducen a su lema singular "señoría", pero unas pocas no, y esas
+#    sobrevivían sin filtrar (se detectó revisando el modelado de temas de
+#    la sección 5, donde "señorías" aparecía como palabra de alta frecuencia
+#    en varios tópicos pese a este filtro). Doble entrada como red de
+#    seguridad frente a esa imperfección del lematizador.
+stopwords_institucionales <- c(
+  stopwords("spanish"), 
+  "gobierno", "españa", "presidente", "señoría", "señorías", "señor", 
+  "diputado", "camara", "cámara", "español", "hoy",
+  "consiguiente",
+  # Añadidas tras revisar el keyness por discurso: fórmulas de cortesía
+  # parlamentaria ("Señora presidenta", repetido 11 veces solo en Aznar
+  # 2000) y muletillas sin contenido propio ("punto de vista")
+  "señora", "presidenta", "vista", "punto"
+)
+
+# 4. Filtrado: nos quedamos con sustantivos, nombres propios y adjetivos
+anno_clean <- anno_df %>%
+  filter(upos %in% c("NOUN", "PROPN", "ADJ")) %>%
+  mutate(lemma_lower = tolower(lemma)) %>%
+  filter(!lemma_lower %in% stopwords_institucionales, nchar(lemma_lower) > 2)
+
+# Reconstrucción de los tokens a partir de los lemas limpios
+toks_lemmas <- split(anno_clean$lemma_lower, anno_clean$doc_id) %>%
+  as.tokens()
+
+# Reorganización en el orden original de los documentos (split() reordena
+# alfabéticamente por doc_id, lo cual descuadraría el orden cronológico)
+toks_lemmas <- toks_lemmas[docnames(discursos)]
+
+dfm_lemmas <- dfm(toks_lemmas)
+docvars(dfm_lemmas) <- docvars(discursos)
+```
+
+---
+
+# 2. Estilo y forma del discurso
+
+## 2.1 Legibilidad (Fernández-Huerta)
+
+`textstat_readability()` de quanteda no incluye fórmulas calibradas para
+español (Flesch-Kincaid y FOG están pensadas para inglés, con distribuciones
+de sílabas y longitud de palabra propias de ese idioma). En su lugar
+calculamos a mano el **índice de Fernández-Huerta** (1959), la adaptación
+clásica de Flesch para español — a diferencia de Flesch-Kincaid, aquí un
+valor **más alto significa texto más fácil de leer**.
+
+*Aviso sobre el conteo de sílabas: `contar_silabas_es()` cuenta grupos de
+vocales tras quitar los acentos (así evitamos el bug de `nsyllable()`, que
+daba `NA` en palabras como "sí" o "él"), pero no aplica todas las reglas de
+diptongo/hiato del español — es una aproximación razonable para comparar
+tendencias entre discursos, no un silabeador perfecto.*
+
+```{r 2.1-legibilidad-(índice-fernández-huerta)}
+contar_silabas_es <- function(palabras) {
+  palabras_clean <- stringi::stri_trans_general(palabras, "Latin-ASCII")
+  pmax(stringr::str_count(tolower(palabras_clean), "[aeiou]+"), 1)
+}
+
+toks_legibilidad <- tokens(discursos, remove_punct = TRUE, remove_numbers = TRUE)
+
+n_palabras <- ntoken(toks_legibilidad)
+n_frases <- nsentence(discursos)
+
+n_silabas <- sapply(as.list(toks_legibilidad), function(p) {
+  sum(contar_silabas_es(p), na.rm = TRUE)
+})
+
+legibilidad <- data.frame(
+  doc_id = docnames(discursos),
+  Presidente = docvars(discursos, "Presidente"),
+  Partido = docvars(discursos, "Partido"),
+  Año = docvars(discursos, "Año"),
+  n_palabras = n_palabras,
+  n_frases = n_frases,
+  n_silabas = n_silabas
+) %>%
+  mutate(
+    ASL = n_palabras / n_frases,
+    silabas_por_palabra = n_silabas / n_palabras,
+    Fernandez_Huerta = 206.84 - 1.02 * ASL - 60 * silabas_por_palabra
+  )
+
+ggplot(legibilidad, aes(x = Año, y = Fernandez_Huerta)) +
+  geom_line(color = "grey60") +
+  geom_point(aes(color = Partido), size = 3.5) +
+  geom_text(aes(label = nombres_cortos[as.character(Presidente)]),
+            vjust = -1.1, size = 2.7, color = "grey30", show.legend = FALSE) +
+  scale_color_manual(values = colores_partidos) +
+  theme_minimal() +
+  labs(title = "Evolución de la legibilidad (Índice Fernández-Huerta)",
+       subtitle = "Valores más altos indican textos más fáciles de comprender",
+       y = "Índice Fernández-Huerta", x = "Año", color = "Partido")
+```
+
+## 2.2 Extensión del discurso
+
+Usamos el `doc_id` en el eje X (un discurso por barra) en vez de agrupar por
+presidente — con varios presidentes con más de un discurso, agrupar por
+nombre apilaría y sumaría las frases de discursos distintos bajo la misma
+etiqueta, dando una cifra sin sentido.
+
+```{r 2.2-extensión-del-discurso}
+resumen_corpus <- resumen_corpus %>%
+  mutate(doc_id = factor(Text, levels = Text[order(docvars(discursos, "Año"))]))
+
+ggplot(resumen_corpus, aes(x = doc_id, y = Sentences, fill = Partido)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Sentences), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = colores_partidos) +
+  labs(title = "Extensión de cada discurso de investidura",
+       subtitle = "Número total de frases por discurso",
+       x = NULL, y = "Frases", fill = "Partido") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 2.3 Riqueza léxica basada en lemas (MATTR)
+
+Al calcular el **MATTR** sobre **lemas en lugar de palabras inflectadas**, obtenemos una medida real de la diversidad temática del vocabulario, eliminando la falsa riqueza producida por las conjugaciones verbales.
+
+```{r 2.3-riqueza-léxica-basada-en-lemas-(mattr)}
+riqueza_lemmas <- textstat_lexdiv(
+  toks_lemmas,
+  measure = "MATTR", MATTR_window = 100
+)
+riqueza_lemmas$Presidente <- docvars(discursos, "Presidente")
+riqueza_lemmas$Partido <- docvars(discursos, "Partido")
+riqueza_lemmas$Año <- docvars(discursos, "Año")
+
+ggplot(riqueza_lemmas, aes(x = Año, y = MATTR)) +
+  geom_line(color = "grey60") +
+  geom_point(aes(color = Partido), size = 3.5) +
+  geom_text(aes(label = nombres_cortos[as.character(Presidente)]),
+            vjust = -1.1, size = 2.7, color = "grey30", show.legend = FALSE) +
+  scale_color_manual(values = colores_partidos) +
+  theme_minimal() +
+  labs(title = "Evolución de la riqueza léxica sobre lemas (MATTR, ventana = 100)",
+       subtitle = "Proporción móvil de lemas únicos por cada 100 palabras",
+       y = "MATTR (Lemas)", x = "Año", color = "Partido")
+```
+
+---
+
+# 3. Contenido: palabras clave y lemas
+
+## 3.1 Lemas más frecuentes (Global)
+
+Frecuencia absoluta de cada lema en el corpus completo, ya lematizado y sin
+stopwords institucionales — un primer vistazo al vocabulario dominante antes
+de entrar en comparaciones por presidente.
+
+```{r 3.1-palabras-más-frecuentes-(lemas)}
+top_terms_lemmas <- topfeatures(dfm_lemmas, 20)
+
+ggplot(data.frame(lema = names(top_terms_lemmas), frecuencia = top_terms_lemmas),
+       aes(x = reorder(lema, frecuencia), y = frecuencia)) +
+  geom_bar(stat = "identity", fill = "#2E86C1") +
+  coord_flip() +
+  labs(title = "Top 20 lemas más frecuentes en el corpus",
+       subtitle = "Lemas consolidados tras eliminar stopwords institucionales",
+       x = NULL, y = "Frecuencia absoluta") +
+  theme_minimal()
+```
+
+## 3.2 Nube de palabras comparativa por presidente
+
+Una nube por presidente, con el tamaño de cada lema proporcional a su
+frecuencia dentro de sus propios discursos (agrupados en un único documento
+por presidente) — útil para una primera impresión visual, aunque la lectura
+cuantitativa fiable de qué distingue a cada uno viene del *keyness* de la
+sección 3.4.
+
+```{r 3.2-nube-de-palabras-comparativa-por-presidente, fig.height=9}
+dfm_por_presidente_lemmas <- dfm_lemmas %>%
+  dfm_group(groups = Presidente) %>%
+  dfm_trim(min_termfreq = 5)
+
+set.seed(30)
+textplot_wordcloud(dfm_por_presidente_lemmas, comparison = TRUE, max_words = 150,
+                    color = RColorBrewer::brewer.pal(8, "Dark2"))
+```
+
+## 3.3 Nube de palabras con forma
+
+Como variante visual de la comparativa anterior, generamos una nube de todo el
+corpus con una silueta definida en vez del típico rectángulo, usando las formas
+predefinidas de `wordcloud2` (sin necesidad de ninguna imagen externa).
+
+```{r 3.3-nube-de-palabras-con-forma}
+set.seed(42)  # fija el layout de la nube para que sea reproducible
+
+frecuencias_lemas <- dfm_lemmas %>%
+  dfm_trim(min_termfreq = 5) %>%
+  colSums() %>%
+  sort(decreasing = TRUE) %>%
+  head(150)
+
+datos_nube <- data.frame(word = names(frecuencias_lemas), freq = frecuencias_lemas)
+
+wordcloud2(datos_nube, shape = "star", color = "random-dark", backgroundColor = "white")
+```
+
+## 3.4 Perfil temático por discurso (diccionario simple)
+
+Complementamos el *keyness* (que busca qué distingue a cada discurso frente
+al resto) con un diccionario temático manual: listas de palabras agrupadas
+por categoría, contadas directamente sobre el texto completo de cada
+discurso. Es una medida más burda que el *keyness* — no busca lo distintivo,
+solo cuenta presencia — pero responde a una pregunta distinta y
+complementaria: no "qué tiene de especial este discurso", sino "cuánto de su
+vocabulario cae en cada categoría, en términos absolutos".
+
+Calculamos por **discurso individual**, no por presidente agregado — por el
+mismo motivo que en el *keyness*: agregar los cuatro discursos de González,
+por ejemplo, esconde cualquier diferencia entre 1982 y 1993.
+
+```{r 3.4-perfil-temático-por-discurso}
+diccionario_tematico <- dictionary(list(
+  economia = c("empleo", "paro", "desempleo", "deuda", "presupuesto", "privatización",
+               "mercado", "inflación", "impuesto", "fiscal", "económico", "crecimiento",
+               "competitividad", "déficit", "recuperación"),
+  social = c("mujer", "igualdad", "inmigración", "inmigrante", "sanidad", "pensión",
+             "vivienda", "dependencia", "discriminación", "género", "lgtbi", "decente"),
+  europeo = c("europa", "europeo", "comunitario", "comunidad", "tratado", "adhesión",
+              "unión", "euro", "eurozona")
+))
+
+# Sin dfm_group(): un documento por discurso individual, no por presidente
+dfm_tematico <- dfm_lemmas %>%
+  dfm_lookup(diccionario_tematico)
+
+prop_tematico <- dfm_tematico %>%
+  dfm_weight(scheme = "prop") %>%
+  convert(to = "data.frame") %>%
+  mutate(etiqueta = factor(etiquetas_fila[doc_id], levels = orden_cronologico)) %>%
+  pivot_longer(-c(doc_id, etiqueta), names_to = "categoria", values_to = "proporcion")
+
+ggplot(prop_tematico, aes(x = etiqueta, y = proporcion, fill = categoria)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Perfil temático por discurso",
+       subtitle = "De las palabras clasificadas en estas 3 categorías, % que cae en cada una",
+       x = NULL, y = "Proporción", fill = "Categoría") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 3.4.1 Por qué NO añadimos una categoría "adversarial" a este diccionario
+
+La primera versión de este diccionario incluía una cuarta categoría para medir
+lenguaje de confrontación política, descartada por dos problemas: nombrar a
+un rival concreto (p. ej. "vox") solo tiene sentido a partir de 2020, y —más
+de fondo— un diccionario de palabras sueltas no detecta la negación.
+Comprobado con el texto real, el discurso con el recuento más alto (Sánchez
+2020) resultó estar **rechazando** la hostilidad ("no tenemos enemigos"), no
+ejerciéndola — justo lo contrario de lo que sugería el número bruto.
+Explicación completa, con las citas y el razonamiento, en el informe
+(apartado 3.3.1).
+
+Esta comprobación se puede reproducir directamente sobre el texto de origen:
+
+```{r 3.4.1-verificación-de-los-ejemplos-citados}
+# Reproduce los ejemplos citados en el informe (apartado 3.3.1) directamente
+# sobre el texto de los discursos, para que la afirmación sea verificable
+# ejecutando el documento, no solo una cita pegada en la prosa.
+extraer_contexto <- function(doc_id, patron, ventana = 80) {
+  texto_plano <- gsub("[\r\n]+", " ", as.character(discursos[doc_id]))
+  m <- gregexpr(patron, texto_plano, ignore.case = TRUE, perl = TRUE)[[1]]
+  if (m[1] == -1) return(character(0))
+  largos <- attr(m, "match.length")
+  mapply(function(inicio, largo) {
+    desde <- max(1, inicio - ventana)
+    hasta <- min(nchar(texto_plano), inicio + largo + ventana)
+    substr(texto_plano, desde, hasta)
+  }, m, largos)
+}
+
+cat("--- 'enemigo' en 2020 Sánchez (rechazo, no hostilidad) ---\n")
+cat(extraer_contexto("2020Sanchez", "enemigo[s]?"), sep = "\n\n")
+
+cat("\n--- 'división' en 2020 Sánchez (rechazo, no hostilidad) ---\n")
+cat(extraer_contexto("2020Sanchez", "división"), sep = "\n\n")
+
+cat("\n--- 'ataque' en 2023 Sánchez (adversarial genuino, sin negar) ---\n")
+cat(extraer_contexto("2023Sanchez", "ataque[s]?"), sep = "\n\n")
+
+cat("\n--- 'confrontación' en 2023 Sánchez (adversarial genuino, sin negar) ---\n")
+cat(extraer_contexto("2023Sanchez", "confrontación"), sep = "\n\n")
+```
+
+Por esto, esta categoría no aparece como resultado cuantificado — el hallazgo
+real sobre confrontación directa (Sánchez, único presidente que nombra
+explícitamente a un rival político) sigue documentado, pero en el *keyness*
+(sección 3.5), que sí detecta distintividad léxica sin necesitar entender
+negaciones.
+
+## 3.5 Keyness: lemas distintivos por discurso
+
+`textstat_keyness()` compara un grupo "objetivo" frente al resto del corpus
+combinado, y extrae mediante una prueba chi-cuadrado qué lemas están
+estadísticamente más asociados a ese grupo. Calculamos **cada discurso
+individual contra el resto** (no cada presidente agregado) — así podemos ver
+si hay variación dentro de un mismo presidente entre distintas legislaturas
+(por ejemplo, Aznar 1996, con necesidad de apoyos de PNV/CiU, frente a Aznar
+2000, con mayoría absoluta), algo que se pierde si se agregan sus dos
+discursos en un solo bloque. También mantiene la coherencia con el resto del
+documento, que ya trabaja discurso a discurso en casi todas las secciones.
+
+Con 15 discursos y 8 palabras por panel, un único gráfico queda demasiado
+apretado para leerse con comodidad. En vez de recortar palabras, lo partimos
+en dos por época — cada mitad respira mucho más sin perder ninguna de las 8.
+
+```{r 3.5-preparación-keyness}
+dfm_keyness <- dfm_lemmas %>%
+  dfm_trim(min_termfreq = 3)
+
+keyness_lemmas <- lapply(docnames(dfm_keyness), function(doc) {
+  resultado <- textstat_keyness(dfm_keyness, target = doc)
+  resultado$doc_id <- doc
+  resultado %>%
+    filter(chi2 > 0) %>%
+    slice_max(chi2, n = 8)
+}) %>%
+  bind_rows() %>%
+  mutate(
+    etiqueta = factor(etiquetas_fila[doc_id], levels = orden_cronologico),
+    Partido  = docvars(discursos, "Partido")[match(doc_id, docnames(discursos))],
+    Año      = docvars(discursos, "Año")[match(doc_id, docnames(discursos))]
+  )
+
+plot_keyness <- function(datos, titulo) {
+  ggplot(datos,
+         aes(x = reorder_within(feature, chi2, etiqueta), y = chi2, fill = Partido)) +
+    geom_col(show.legend = TRUE) +
+    scale_x_reordered() +
+    scale_fill_manual(values = colores_partidos) +
+    coord_flip() +
+    facet_wrap(~ etiqueta, scales = "free", ncol = 2) +
+    labs(title = titulo,
+         subtitle = "Fuerza de asociación medida con prueba Chi-cuadrado -- por discurso, no por presidente",
+         x = NULL, y = "Chi-cuadrado (Asociación)") +
+    theme_minimal(base_size = 12)
+}
+```
+
+**Transición y consolidación democrática (1979-2000):**
+
+```{r 3.5a-keyness-1979-2000, fig.width=11, fig.height=11}
+plot_keyness(keyness_lemmas %>% filter(Año < 2004),
+             "Lemas más característicos por discurso (1979-2000)")
+```
+
+**Etapa reciente (2004-2023):**
+
+```{r 3.5b-keyness-2004-2023, fig.width=11, fig.height=10}
+plot_keyness(keyness_lemmas %>% filter(Año >= 2004),
+             "Lemas más característicos por discurso (2004-2023)")
+```
+
+## 3.6 Contexto de palabras clave (KWIC)
+
+```{r 3.6-contexto-de-palabras-clave-(kwic)}
+toks_sin_limpiar <- tokens(discursos, remove_punct = TRUE)
+
+# etiquetas_fila / orden_fila ya están calculadas en la sección 1 (se
+# reutilizan aquí y en el resto de gráficos del documento)
+plot_kwic_tematico <- function(terminos, titulo) {
+  resultado_kwic <- kwic(toks_sin_limpiar, pattern = terminos)
+  if (nrow(resultado_kwic) > 0) {
+    resultado_kwic$docname <- factor(etiquetas_fila[as.character(resultado_kwic$docname)],
+                                       levels = orden_fila)
+  }
+  textplot_xray(resultado_kwic) +
+    aes(color = keyword) +
+    labs(title = titulo, y = "Discurso (año y presidente)") +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      strip.background = element_rect(fill = "grey95"),
+      strip.text.y = element_text(angle = 0, size = 7)
+    )
+}
+```
+
+
+Cada gráfico se limita a 2-3 términos de un mismo eje temático — meter más
+satura la lectura. Estos son los seis ejes elegidos, cada uno pensado para
+trazar un arco histórico reconocible en 44 años de discursos:
+
+**Terrorismo y paz** — presencia casi constante hasta la disolución de ETA (2018):
+
+```{r kwic-terrorismo, fig.height=8}
+plot_kwic_tematico(c("terrorismo", "eta", "paz"), "Eje: Terrorismo y paz")
+```
+
+**Integración europea** — desde la entrada en la CEE (1986) hasta el euro:
+
+```{r kwic-europa, fig.height=8}
+plot_kwic_tematico(c("europ*", "euro"), "Eje: Integración europea")
+```
+
+**Economía y crisis** — las dos grandes crisis económicas (1993 y 2008-2011):
+
+```{r kwic-crisis, fig.height=8}
+plot_kwic_tematico(c("crisis", "paro", "desempleo"), "Eje: Economía y crisis")
+```
+
+**Cuestión territorial** — especialmente relevante desde 2010 en adelante:
+
+```{r kwic-territorial, fig.height=8}
+plot_kwic_tematico(c("autonom*", "cataluña"), "Eje: Cuestión territorial")
+```
+
+**Igualdad** — hipótesis: mayor presencia cuanto más reciente el discurso:
+
+```{r kwic-igualdad, fig.height=8}
+plot_kwic_tematico(c("mujer*", "igualdad"), "Eje: Igualdad")
+```
+
+**Gobernabilidad y pactos** — especialmente relevante en gobiernos de coalición o en minoría (Sánchez 2020/2023) frente a las mayorías absolutas de otras épocas:
+
+```{r kwic-gobernabilidad, fig.height=8}
+plot_kwic_tematico(c("diálogo", "consenso", "pact*"), "Eje: Gobernabilidad y pactos")
+```
+
+---
+
+# 4. Similitud entre discursos (Ponderación TF-IDF)
+
+## 4.1 Matriz de similitud coseno con TF-IDF
+
+Al transformar la matriz DFM a valores **TF-IDF** (*Term Frequency - Inverse Document Frequency*), penalizamos las palabras que aparecen por igual en todos los discursos y premiamos la coincidencia en términos específicos. Esto soluciona la excesiva homogeneidad de la versión no ponderada.
+
+```{r 4.1-matriz-de-similitud-coseno-ponderada-(tf-idf)}
+dfm_tfidf_lemmas <- dfm_tfidf(dfm_lemmas)
+
+similitud_tfidf <- textstat_simil(dfm_tfidf_lemmas, method = "cosine", margin = "documents")
+similitud_matrix_tfidf <- as.matrix(similitud_tfidf)
+
+df_similitud_tfidf <- as.data.frame(similitud_matrix_tfidf) %>%
+  mutate(doc1 = factor(rownames(.), levels = docnames(discursos))) %>%
+  pivot_longer(-doc1, names_to = "doc2", values_to = "similitud") %>%
+  mutate(doc2 = factor(doc2, levels = docnames(discursos)))
+
+ggplot(df_similitud_tfidf, aes(x = doc1, y = doc2, fill = similitud)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "YlOrRd"), name = "Similitud TF-IDF") +
+  labs(title = "Matriz de similitud coseno con ponderación TF-IDF",
+       subtitle = "Alta discriminación temática entre etapas políticas",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4.2 Clustering jerárquico ponderado
+
+Agrupa los discursos según lo parecidos que son en su vocabulario, partiendo
+de la **misma matriz de similitud TF-IDF** del apartado anterior (convertida
+a distancia como `1 - similitud`) para que heatmap y dendrograma cuenten la
+misma historia con la misma métrica. Usamos `ward.D2` como método de enlace
+porque minimiza la varianza dentro de cada grupo y evita el "efecto cadena"
+(clusters alargados y poco informativos) típico de otros métodos como
+`average`. Lo interesante de leer aquí no es tanto qué dos discursos
+concretos se juntan primero, sino **a qué altura se separan los grandes
+bloques** — cuanto más alto el punto de unión, más distintos son entre sí.
+
+```{r 4.2-clustering-jerárquico}
+distancias_tfidf <- as.dist(1 - similitud_matrix_tfidf)
+hc_tfidf <- hclust(distancias_tfidf, method = "ward.D2")
+
+dendro_tfidf <- dendro_data(hc_tfidf, type = "rectangle")
+dendro_tfidf$labels$label <- str_wrap(dendro_tfidf$labels$label, width = 20)
+
+ggplot() +
+  geom_segment(data = dendro_tfidf$segments,
+               aes(x = x, y = y, xend = xend, yend = yend), color = "grey40") +
+  geom_text(data = dendro_tfidf$labels,
+            aes(x = x, y = y - 0.02, label = label),
+            angle = 45, hjust = 1, size = 3.3) +
+  labs(title = "Agrupación jerárquica de discursos (Similitud TF-IDF)",
+       subtitle = "Distancia coseno TF-IDF con enlace Ward.D2",
+       x = NULL, y = "Distancia TF-IDF") +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        plot.margin = margin(t = 20, r = 20, b = 60, l = 20))
+```
+
+---
+
+# 5. Modelado de temas (*Structural Topic Model - STM*)
+
+A través de **STM** podemos agrupar las palabras en $K=5$ tópicos latentes o agendas de gobierno, estimando la proporción de cada tópico según el partido político y la evolución temporal.
+
+**Aviso metodológico importante, léelo antes de interpretar los resultados:**
+STM está pensado habitualmente para corpus de cientos o miles de documentos.
+Aquí tenemos **15**. La fórmula de prevalencia `~ Partido + ns(Año, df = 3)`
+implica estimar del orden de 5-6 parámetros — casi tantos como documentos hay
+en el corpus. Esto significa que el modelo tiene un margen enorme para
+sobreajustar: los 5 temas que salgan pueden depender bastante de qué 15
+discursos concretos tengamos, y probablemente cambiarían si quitas un
+discurso o cambias la semilla aleatoria. Trata esta sección como una
+**exploración ilustrativa de la técnica**, no como una conclusión firme sobre
+las agendas políticas reales — y dilo así explícitamente si presentas este
+proyecto, en vez de afirmar los temas como un hallazgo consolidado.
+
+```{r 5.1-modelado-de-temas-con-stm-(structural-topic-model), fig.width=11, fig.height=5}
+library(splines)
+
+# 1. Filtro de stopwords políticas y conectores
+#    (incluye "señorías" además de "señoría" por el mismo motivo explicado
+#    en la sección 1.2: UDPipe no lematiza esta palabra al 100% de precisión)
+stopwords_politica <- c(
+  "señoría", "señorías", "política", "político", "país", "español", "social", 
+  "nacional", "problema", "nuevo", "necesario", "general", "medida",
+  "pues", "consiguiente", "vista", "agosto", "junio"
+)
+
+dfm_stm_limpia <- dfm_lemmas %>%
+  dfm_remove(stopwords_politica) %>%
+  dfm_trim(max_docfreq = 0.75, docfreq_type = "prop", min_termfreq = 3)
+
+# 2. Convertir a formato STM
+stm_data <- convert(dfm_stm_limpia, to = "stm")
+stm_data$meta$Año <- as.numeric(stm_data$meta$Año)
+
+set.seed(123)
+modelo_stm <- stm(
+  documents  = stm_data$documents,
+  vocab      = stm_data$vocab,
+  K          = 5,
+  prevalence = ~ Partido + ns(Año, df = 3),
+  data       = stm_data$meta,
+  verbose    = FALSE
+)
+
+# 3. Gráfico con margen derecho extra amplio (15) y límite X ampliado (0.75)
+op <- par(mar = c(5, 4, 4, 15)) 
+plot(
+  modelo_stm, 
+  type = "summary", 
+  labeltype = "frex", 
+  n = 4, 
+  main = "Top 5 Tópicos Latentes por Exclusividad (FREX)",
+  xlim = c(0, 0.75)
+)
+par(op) # Restaurar márgenes por defecto
+
+
+```
+```{r 5.1b-temas-k5}
+labelTopics(modelo_stm, n = 10)
+```
+
+
+## 5.2 Evolución de tópicos por partido y época
+
+`theta` es la matriz que guarda, para cada discurso, **qué proporción de su
+contenido corresponde a cada uno de los 5 tópicos** (las filas suman 1). El
+gráfico de barras apiladas muestra esa proporción año a año; la tabla de
+abajo la deja en formato consultable, fila por discurso.
+
+```{r 5.2-evolución-de-tópicos-por-partido-y-año, fig.height=6}
+# Extraer la matriz de proporciones de tópicos por documento (Theta)
+theta_df <- as.data.frame(modelo_stm$theta)
+colnames(theta_df) <- paste0("Tópico_", 1:5)
+
+# Vinculación segura de metadatos desde la estructura stm_data$meta
+theta_df$Presidente <- stm_data$meta$Presidente
+theta_df$Partido    <- stm_data$meta$Partido
+theta_df$Año        <- stm_data$meta$Año
+theta_df$etiqueta   <- paste(theta_df$Año, nombres_cortos[as.character(theta_df$Presidente)])
+
+# Reestructuración a formato largo para ggplot
+theta_long <- theta_df %>%
+  pivot_longer(cols = starts_with("Tópico_"), names_to = "Topico", values_to = "Proporcion") %>%
+  mutate(etiqueta = factor(etiqueta, levels = orden_cronologico))
+
+# Gráfico de barras apiladas por año
+ggplot(theta_long, aes(x = etiqueta, y = Proporcion, fill = Topico)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set2", name = "Tópico STM") +
+  labs(title = "Distribución de tópicos estructurales por discurso",
+       subtitle = "Evolución de las cargas temáticas a lo largo de las investiduras",
+       x = "Discurso (año y presidente)", y = "Proporción acumulada") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r 5.2b-tabla-theta-k5}
+# Tabla de proporciones tema-documento, para consulta directa (no solo el gráfico apilado)
+theta_export <- theta_df %>%
+  mutate(across(starts_with("Tópico_"), ~ round(.x, 3))) %>%
+  select(Año, Presidente, Partido, everything())
+
+datatable(theta_export, rownames = FALSE,
+          caption = "Proporción de cada tópico STM (K=5) por discurso")
+```
+
+
+## 5.3 STM alternativo (K=3, sin covariables de prevalencia)
+
+
+*Prueba de robustez frente al modelo principal (K=5, con covariables). Si los
+temas que salen aquí son razonablemente parecidos a una versión "fusionada"
+de los 5 anteriores, es una señal (no una prueba definitiva) de que el modelo
+está capturando algo mínimamente estable y no puro ruido de sobreajuste. Si
+salen completamente distintos, es la señal contraria.*
+
+```{r 5.3-stm-alternativo-k3-sin-covariables, fig.width=11, fig.height=4}
+set.seed(123)
+modelo_stm_k3 <- stm(
+  documents  = stm_data$documents,
+  vocab      = stm_data$vocab,
+  K          = 3,
+  data       = stm_data$meta,
+  verbose    = FALSE
+)
+
+plot(modelo_stm_k3, type = "summary", labeltype = "frex", n = 4,
+     main = "Top 3 Tópicos Latentes (K=3, sin covariables) por Exclusividad (FREX)")
+```
+
+```{r 5.3b-temas-k3}
+labelTopics(modelo_stm_k3, n = 10)
+```
+## 5.4 Proporción de tópicos por discurso (STM K=3, sin covariables)
+
+Mismo concepto de `theta` que en 5.2, aplicado ahora al modelo K=3 sin
+covariables — compara este reparto con el de arriba para juzgar si ambos
+modelos cuentan una historia parecida o no.
+
+```{r 5.4-proporción-de-tópicos-stm-k3, fig.height=6}
+# Extraer la matriz de proporciones de tópicos por documento (Theta)
+theta_df_k3 <- as.data.frame(modelo_stm_k3$theta)
+colnames(theta_df_k3) <- paste0("Tópico_", 1:3)
+
+# Vinculación segura de metadatos desde la estructura stm_data$meta
+theta_df_k3$Presidente <- stm_data$meta$Presidente
+theta_df_k3$Partido    <- stm_data$meta$Partido
+theta_df_k3$Año        <- stm_data$meta$Año
+theta_df_k3$etiqueta   <- paste(theta_df_k3$Año, nombres_cortos[as.character(theta_df_k3$Presidente)])
+
+# Reestructuración a formato largo para ggplot
+theta_long_k3 <- theta_df_k3 %>%
+  pivot_longer(cols = starts_with("Tópico_"), names_to = "Topico", values_to = "Proporcion") %>%
+  mutate(etiqueta = factor(etiqueta, levels = orden_cronologico))
+
+# Gráfico de barras apiladas por año
+ggplot(theta_long_k3, aes(x = etiqueta, y = Proporcion, fill = Topico)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set2", name = "Tópico STM") +
+  labs(title = "Distribución de tópicos estructurales por discurso",
+       subtitle = "Evolución de las cargas temáticas a lo largo de las investiduras",
+       x = "Discurso (año y presidente)", y = "Proporción acumulada") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r 5.4b-tabla-theta-k3}
+# Tabla de proporciones tema-documento, para consulta directa (no solo el gráfico apilado)
+theta_export_k3 <- theta_df_k3 %>%
+  mutate(across(starts_with("Tópico_"), ~ round(.x, 3))) %>%
+  select(Año, Presidente, Partido, everything())
+
+datatable(theta_export_k3, rownames = FALSE,
+          caption = "Proporción de cada tópico STM (K=3) por discurso")
+```
+
+---
+
+# 6. Sentimiento y perfil emocional
+
+## 6.1 Tono neto de sentimiento
+
+Usamos `syuzhet::get_nrc_sentiment(language = "spanish")`, que aplica una
+traducción del léxico NRC al español para clasificar cada palabra como
+positiva o negativa.
+
+**Aviso honesto**: ese léxico en español es una **traducción automática**
+del original en inglés, no un diccionario validado nativamente para
+español — de ahí que en la sección 6.3 lo complementemos con ML-Senticon,
+un léxico revisado por hablantes nativos. Trata esta sección como una
+aproximación exploratoria del tono, no como una medición de referencia.
+
+```{r 6.1-análisis-de-sentimiento-con-léxico-nativo}
+textos_raw <- as.character(discursos)
+sentimientos <- get_nrc_sentiment(textos_raw, language = "spanish")
+
+df_sent <- data.frame(
+  doc_id     = docnames(discursos),
+  Presidente = docvars(discursos, "Presidente"),
+  Partido    = docvars(discursos, "Partido"),
+  Año        = docvars(discursos, "Año"),
+  positive   = sentimientos$positive,
+  negative   = sentimientos$negative
+) %>%
+  mutate(tono_neto = (positive - negative) / (positive + negative))
+
+ggplot(df_sent, aes(x = Año, y = tono_neto)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(color = "grey60") +
+  geom_point(aes(color = Partido), size = 3.5) +
+  geom_text(aes(label = nombres_cortos[as.character(Presidente)]),
+            vjust = -1.1, size = 2.7, color = "grey30", show.legend = FALSE) +
+  scale_color_manual(values = colores_partidos) +
+  labs(title = "Evolución del tono neto del discurso",
+       subtitle = "Proporción relativa entre vocablo positivo y negativo",
+       y = "Tono neto", x = "Año", color = "Partido") +
+  theme_minimal()
+```
+
+## 6.2 Desglose de emociones discretas (NRC)
+
+Más allá del tono positivo/negativo, el léxico NRC clasifica palabras en
+ocho emociones básicas del modelo de Plutchik (ira, anticipación, asco,
+miedo, alegría, tristeza, sorpresa, confianza). El mismo aviso de la
+sección 6.1 sobre la traducción automática aplica aquí también — y con más
+motivo, porque clasificar en 8 categorías finas es más exigente para un
+léxico traducido que una simple polaridad positivo/negativo.
+
+```{r 6.2-desglose-de-emociones-discretas}
+emociones_df <- sentimientos %>%
+  select(-positive, -negative) %>%
+  mutate(
+    doc_id     = docnames(discursos),
+    Presidente = docvars(discursos, "Presidente"),
+    Partido    = docvars(discursos, "Partido"),
+    Año        = docvars(discursos, "Año"),
+    etiqueta   = factor(paste(Año, nombres_cortos[as.character(Presidente)]), levels = orden_cronologico)
+  ) %>%
+  pivot_longer(
+    cols = c(anger, anticipation, disgust, fear, joy, sadness, surprise, trust),
+    names_to = "emocion", values_to = "conteo"
+  ) %>%
+  group_by(doc_id) %>%
+  mutate(prop = conteo / sum(conteo)) %>%
+  ungroup()
+
+emociones_es <- c(
+  "anger" = "Ira", "anticipation" = "Anticipación", "disgust" = "Asco",
+  "fear" = "Miedo", "joy" = "Alegría", "sadness" = "Tristeza",
+  "surprise" = "Sorpresa", "trust" = "Confianza"
+)
+emociones_df$emocion_es <- emociones_es[emociones_df$emocion]
+
+ggplot(emociones_df, aes(x = etiqueta, y = prop, fill = emocion_es)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_brewer(palette = "Set3", name = "Emoción") +
+  labs(title = "Perfil emocional del discurso (Clasificación NRC)",
+       subtitle = "Proporción relativa de términos asociados a emociones básicas por discurso",
+       x = "Discurso (año y presidente)", y = "Proporción") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Un gráfico de barras apiladas es cómodo para ver la tendencia general, pero
+comparar la altura exacta de un segmento intermedio (por ejemplo, "Ira" entre
+dos discursos) a simple vista es poco fiable — el ojo no mide bien alturas
+que no arrancan desde cero. Para eso, aquí está la misma información en
+formato numérico, un discurso por fila:
+
+```{r 6.2b-tabla-emociones}
+emociones_tabla <- emociones_df %>%
+  select(etiqueta, emocion_es, prop) %>%
+  mutate(prop = round(prop, 3)) %>%
+  pivot_wider(names_from = emocion_es, values_from = prop)
+
+datatable(emociones_tabla, rownames = FALSE,
+          caption = "Proporción exacta de cada emoción NRC por discurso",
+          options = list(pageLength = 15))
+```
+
+## 6.3 Tono con léxico nativo en español (ML-SentiCon)
+
+Complementamos el tono NRC (traducido automáticamente al español) con **ML-SentiCon**,
+un léxico de polaridad revisado por hablantes nativos:
+
+> Cruz, F. L., Troyano, J. A., Pontes, B., & Ortega, F. J. (2014). *ML-SentiCon:
+> Un lexicón multilingüe de polaridades semánticas a nivel de lemas*.
+> Procesamiento del Lenguaje Natural, 53, 113-120.
+
+No sustituye al léxico NRC — lo tratamos como una segunda fuente independiente
+para ver si ambos coinciden en la tendencia general.
+
+```{r 6.3-cargar-ml-senticon, message=FALSE, warning=FALSE}
+# Léxico ML-Senticon (Cruz, Troyano, Pontes y Ortega, 2014 -- ver cita completa
+# arriba). Repositorio público: https://github.com/ITALIC-US/ML-Senticon
+library(xml2)
+
+# 1. Ruta y descarga del archivo
+url_senticon <- "https://raw.githubusercontent.com/ITALIC-US/ML-Senticon/main/senticon.es.xml"
+ruta_senticon <- here::here("data", "senticon.es.xml")
+
+if (!file.exists(ruta_senticon)) {
+  download.file(url_senticon, ruta_senticon, mode = "wb")
+}
+
+xml_senticon <- read_xml(ruta_senticon)
+
+# 2. Extracción directa por categoría
+pos_nodes <- xml_find_all(xml_senticon, "//positive/lemma")
+df_pos <- tibble(
+  palabra   = xml_text(pos_nodes) %>% str_trim(),
+  polaridad = as.numeric(xml_attr(pos_nodes, "pol")),
+  pos       = xml_attr(pos_nodes, "pos"),
+  categoria = "positive"
+)
+
+neg_nodes <- xml_find_all(xml_senticon, "//negative/lemma")
+df_neg <- tibble(
+  palabra   = xml_text(neg_nodes) %>% str_trim(),
+  polaridad = as.numeric(xml_attr(neg_nodes, "pol")),
+  pos       = xml_attr(neg_nodes, "pos"),
+  categoria = "negative"
+)
+
+# 3. Combinación y promedio de polaridad por palabra
+senticon_df <- bind_rows(df_pos, df_neg) %>%
+  mutate(polaridad_signo = if_else(categoria == "negative" & polaridad > 0, -polaridad, polaridad)) %>%
+  group_by(palabra) %>%
+  summarise(polaridad = mean(polaridad_signo, na.rm = TRUE), .groups = "drop")
+
+# Chequeo de diagnóstico: si esto imprime 0 (o un número muy pequeño), la
+# estructura real del XML no coincide con las etiquetas "//positive/lemma" y
+# "//negative/lemma" que asumimos aquí, y hay que revisar con xml_structure(xml_senticon)
+cat("Entradas cargadas en senticon_df:", nrow(senticon_df), "\n")
+```
+
+```{r 6.3b-análisis-de-sentimiento-ml-senticon, fig.height=4}
+# 1. Convertir la DFM (sin lematizar, para maximizar coincidencias con el
+#    léxico) a formato largo y cruzar con ML-Senticon
+dfm_discursos_raw <- dfm(tokens(discursos, remove_punct = TRUE, remove_numbers = TRUE))
+
+meta_df <- data.frame(
+  doc_id     = docnames(discursos),
+  Presidente = docvars(discursos, "Presidente"),
+  Partido    = docvars(discursos, "Partido"),
+  Año        = docvars(discursos, "Año")
+)
+
+sentimiento_ml <- tidytext::tidy(dfm_discursos_raw) %>%
+  rename(doc_id = document, palabra = term, frecuencia = count) %>%
+  mutate(palabra = tolower(palabra)) %>%
+  inner_join(senticon_df, by = "palabra") %>%
+  group_by(doc_id) %>%
+  summarise(tono_senticon = sum(polaridad * frecuencia) / sum(frecuencia), .groups = "drop") %>%
+  left_join(meta_df, by = "doc_id")
+
+# 2. Gráfico alineado estéticamente con la versión NRC (6.1), para comparar a simple vista
+ggplot(sentimiento_ml, aes(x = Año, y = tono_senticon)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(color = "grey60") +
+  geom_point(aes(color = Partido), size = 3.5) +
+  geom_text(aes(label = nombres_cortos[as.character(Presidente)]),
+            vjust = -1.1, size = 2.7, color = "grey30", show.legend = FALSE) +
+  scale_color_manual(values = colores_partidos) +
+  labs(
+    title = "Evolución del tono del discurso (ML-Senticon)",
+    subtitle = "Polaridad ponderada con léxico nativo en español",
+    y = "Tono (ML-Senticon)", 
+    x = "Año", 
+    color = "Partido"
+  ) +
+  theme_minimal()
+```
+
+---
+
+## 6.4 Comparación de ambos métodos de sentimiento
+
+Para ver si NRC (traducido) y ML-Senticon (nativo) coinciden en la tendencia
+general, los mostramos uno encima del otro compartiendo el mismo eje X (año),
+con escalas Y **independientes** — no hay garantía de que ambos léxicos midan
+la polaridad en la misma unidad, así que forzar la misma escala podría dar
+una impresión de acuerdo o desacuerdo que no es real.
+
+```{r 6.4-comparación-sentimiento-nrc-vs-senticon, fig.height=7}
+comparacion_sentimiento <- df_sent %>%
+  select(doc_id, Presidente, Partido, Año, valor = tono_neto) %>%
+  mutate(Método = "NRC (traducido)") %>%
+  bind_rows(
+    sentimiento_ml %>%
+      select(doc_id, Presidente, Partido, Año, valor = tono_senticon) %>%
+      mutate(Método = "ML-Senticon (nativo)")
+  ) %>%
+  mutate(Método = factor(Método, levels = c("NRC (traducido)", "ML-Senticon (nativo)")))
+
+ggplot(comparacion_sentimiento, aes(x = Año, y = valor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(color = "grey60") +
+  geom_point(aes(color = Partido), size = 3) +
+  geom_text(aes(label = nombres_cortos[as.character(Presidente)]),
+            vjust = -1.1, size = 2.5, color = "grey30", show.legend = FALSE) +
+  scale_color_manual(values = colores_partidos) +
+  facet_wrap(~ Método, ncol = 1, scales = "free_y") +
+  labs(title = "Comparación del tono del discurso: NRC vs. ML-Senticon",
+       subtitle = "Mismo eje X (año); escalas Y independientes, los dos léxicos no comparten unidad de medida",
+       x = "Año", y = "Tono", color = "Partido") +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+```{r 6.4b-correlación-entre-métodos}
+# Coincidencia numérica de tendencia entre ambos léxicos (no de escala, de orden)
+comparacion_wide <- df_sent %>%
+  select(doc_id, tono_neto) %>%
+  inner_join(sentimiento_ml %>% select(doc_id, tono_senticon), by = "doc_id")
+
+test_correlacion <- cor.test(comparacion_wide$tono_neto, comparacion_wide$tono_senticon,
+                              method = "spearman")
+
+cat("Correlación de Spearman entre NRC y ML-Senticon: rho = ",
+    round(test_correlacion$estimate, 2), ", p-valor = ",
+    round(test_correlacion$p.value, 3), "\n",
+    "(rho: 1 = coinciden perfectamente en qué discursos son más/menos positivos; ",
+    "0 = no hay relación; negativo = tienden a discrepar)\n\n",
+    "Aviso: con n=15, la prueba de significancia tiene poca potencia estadística. ",
+    "Un p-valor no significativo (> 0.05) no demuestra que los dos léxicos ",
+    "discrepen -- puede simplemente reflejar que 15 discursos son pocos para ",
+    "detectar la relación con confianza estadística, aunque exista de verdad.\n",
+    sep = "")
+```
+
+*Usamos correlación de **Spearman** (por rangos) en vez de Pearson a propósito:
+lo que nos interesa no es si los números coinciden en valor absoluto (que no
+tienen por qué, al venir de escalas distintas), sino si ambos léxicos
+**ordenan** los discursos de forma parecida — el más positivo, el segundo más
+positivo, etc. Con muestras pequeñas y sin ties (empates) en los valores,
+`cor.test()` calcula además un p-valor exacto en vez de la aproximación
+asintótica habitual — mejor comportamiento con n=15 que una prueba pensada
+para muestras grandes.*
+
+---
+
+# 7. Tabla-resumen consolidada
+
+Reunimos en una sola tabla las métricas clave calculadas en las secciones
+anteriores — una fila por discurso — para consultar o comparar valores
+concretos sin releer cada gráfico. Usamos `DT::datatable()` en vez de
+`kable()` porque el output es HTML: permite ordenar por columna y buscar,
+algo que una tabla estática no ofrece.
+
+```{r 7.-tabla-resumen-consolidada}
+tabla_resumen <- legibilidad %>%
+  select(doc_id, Presidente, Partido, Año, n_palabras, Fernandez_Huerta) %>%
+  left_join(riqueza_lemmas %>% select(document, MATTR), by = c("doc_id" = "document")) %>%
+  left_join(df_sent %>% select(doc_id, tono_neto), by = "doc_id") %>%
+  left_join(sentimiento_ml %>% select(doc_id, tono_senticon), by = "doc_id") %>%
+  arrange(Año) %>%
+  mutate(across(c(Fernandez_Huerta, MATTR, tono_neto, tono_senticon), ~ round(.x, 2))) %>%
+  rename(Palabras = n_palabras,
+         `Fernández-Huerta` = Fernandez_Huerta,
+         `MATTR (Lemas)` = MATTR,
+         `Tono neto (NRC)` = tono_neto,
+         `Tono (ML-SentiCon)` = tono_senticon)
+
+datatable(
+  tabla_resumen,
+  rownames = FALSE,
+  caption = "Tabla-resumen consolidada con métricas morfosintácticas y de sentimiento",
+  options = list(pageLength = 15, order = list(list(3, "asc")))
+)
+```
+
+---
+
+# 8. Conclusiones
+
+En resumen, los datos apuntan a:
+
+- Una **simplificación progresiva y sostenida del estilo** — frases más cortas, léxico más accesible, a lo largo de 44 años.
+- Un **declive del tono positivo del discurso**, especialmente marcado desde 2011, confirmado por **dos léxicos de sentimiento construidos de forma totalmente independiente** (correlación ρ = 0,78; p = 0,001).
+- Una **reconfiguración del espacio político-discursivo desde 2015**, que el análisis de similitud detecta como un bloque diferenciado del resto de la serie histórica — coherente con el fin del bipartidismo.
+- Al menos **cuatro maneras distintas** de ocupar el discurso según la etapa: gestión de política económica nacional, integración institucional europea, ampliación de derechos sociales, y confrontación ideológica directa.
+- Un modelado de temas (STM) con **fiabilidad desigual**: al comparar dos configuraciones distintas del modelo, tres de sus cinco ejes temáticos se mantienen estables; los otros dos, no — y con solo 15 documentos, ningún resultado del STM debe tratarse como concluyente por sí solo.
+
+Para el análisis completo — con el cruce de hallazgos entre secciones, las
+tablas de datos exactas, y los matices necesarios sobre cada uno de estos
+puntos — consulta el [informe de resultados](informe/informe_resultados_discursos_investidura.md).
